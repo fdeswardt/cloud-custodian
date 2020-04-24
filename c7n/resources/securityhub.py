@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from collections import Counter
 from datetime import datetime
 from dateutil.tz import tzutc
@@ -305,7 +303,6 @@ class PostFinding(Action):
     """ # NOQA
 
     FindingVersion = "2018-10-08"
-    ProductName = "default"
 
     permissions = ('securityhub:BatchImportFindings',)
 
@@ -318,6 +315,10 @@ class PostFinding(Action):
             'policy.description, or if not defined in policy then policy.name'},
         severity={"type": "number", 'default': 0},
         severity_normalized={"type": "number", "min": 0, "max": 100, 'default': 0},
+        severity_label={
+            "type": "string", 'default': 'INFORMATIONAL',
+            "enum": ["INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+        },
         confidence={"type": "number", "min": 0, "max": 100},
         criticality={"type": "number", "min": 0, "max": 100},
         # Cross region aggregation
@@ -451,11 +452,9 @@ class PostFinding(Action):
                         'utf8')).hexdigest())
         finding = {
             "SchemaVersion": self.FindingVersion,
-            "ProductArn": "arn:aws:securityhub:{}:{}:product/{}/{}".format(
-                region,
-                self.manager.config.account_id,
-                self.manager.config.account_id,
-                self.ProductName,
+            "ProductArn": "arn:{}:securityhub:{}::product/cloud-custodian/cloud-custodian".format(
+                get_partition(self.manager.config.region),
+                region
             ),
             "AwsAccountId": self.manager.config.account_id,
             # Long search chain for description values, as this was
@@ -474,9 +473,12 @@ class PostFinding(Action):
             "RecordState": "ACTIVE",
         }
 
-        severity = {'Product': 0, 'Normalized': 0}
+        severity = {'Product': 0, 'Normalized': 0, 'Label': 'INFORMATIONAL'}
         if self.data.get("severity") is not None:
             severity["Product"] = self.data["severity"]
+        if self.data.get("severity_label") is not None:
+            severity["Label"] = self.data["severity_label"]
+        # severity_normalized To be deprecated per https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings-format.html#asff-severity # NOQA
         if self.data.get("severity_normalized") is not None:
             severity["Normalized"] = self.data["severity_normalized"]
         if severity:

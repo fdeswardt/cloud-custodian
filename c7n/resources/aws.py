@@ -26,6 +26,7 @@ import shutil
 import sys
 import tempfile
 import time
+import threading
 import traceback
 
 import boto3
@@ -67,7 +68,7 @@ try:
     HAVE_XRAY = True
 except ImportError:
     HAVE_XRAY = False
-    class Context(object): pass  # NOQA
+    class Context: pass  # NOQA
 
 _profile_session = None
 
@@ -166,7 +167,7 @@ class Arn(namedtuple('_Arn', (
         return cls(*parts)
 
 
-class ArnResolver(object):
+class ArnResolver:
 
     def __init__(self, manager):
         self.manager = manager
@@ -285,7 +286,8 @@ class CloudWatchLogOutput(LogOutput):
             self.ctx.policy.name)
 
 
-class XrayEmitter(object):
+class XrayEmitter:
+    # implement https://github.com/aws/aws-xray-sdk-python/issues/51
 
     def __init__(self):
         self.buf = []
@@ -301,18 +303,33 @@ class XrayEmitter(object):
         self.buf = []
         for segment_set in utils.chunks(buf, 50):
             self.client.put_trace_segments(
-                TraceSegmentDocuments=[
-                    s.serialize() for s in segment_set])
+                TraceSegmentDocuments=[s.serialize() for s in segment_set])
 
 
 class XrayContext(Context):
+    """Specialized XRay Context for Custodian.
+
+    A context is used as a segment storage stack for currently in
+    progress segments.
+
+    We use a customized context for custodian as policy execution
+    commonly uses a concurrent.futures threadpool pattern during
+    execution for api concurrency. Default xray semantics would use
+    thread local storage and treat each of those as separate trace
+    executions. We want to aggregate/associate all thread pool api
+    executions to the custoidan policy execution. XRay sdk supports
+    this via manual code for every thread pool usage, but we don't
+    want to explicitly couple xray integration everywhere across the
+    codebase. Instead we use a context that is aware of custodian
+    usage of threads and associates subsegments therein to the policy
+    execution active subsegment.
+    """
 
     def __init__(self, *args, **kw):
         super(XrayContext, self).__init__(*args, **kw)
-        # We want process global semantics as policy execution
-        # can span threads.
         self._local = Bag()
         self._current_subsegment = None
+        self._main_tid = threading.get_ident()
 
     def handle_context_missing(self):
         """Custodian has a few api calls out of band of policy execution.
@@ -324,9 +341,46 @@ class XrayContext(Context):
         so default to disabling context missing output.
         """
 
+    # Annotate any segments/subsegments with their thread ids.
+    def put_segment(self, segment):
+        if getattr(segment, 'thread_id', None) is None:
+            segment.thread_id = threading.get_ident()
+        super().put_segment(segment)
+
+    def put_subsegment(self, subsegment):
+        if getattr(subsegment, 'thread_id', None) is None:
+            subsegment.thread_id = threading.get_ident()
+        super().put_subsegment(subsegment)
+
+    # Override since we're not just popping the end of the stack, we're removing
+    # the thread subsegment from the array by identity.
+    def end_subsegment(self, end_time):
+        subsegment = self.get_trace_entity()
+        if self._is_subsegment(subsegment):
+            subsegment.close(end_time)
+            self._local.entities.remove(subsegment)
+            return True
+        else:
+            log.warning("No subsegment to end.")
+            return False
+
+    # Override get trace identity, any worker thread will find its own subsegment
+    # on the stack, else will use the main thread's sub/segment
+    def get_trace_entity(self):
+        tid = threading.get_ident()
+        entities = self._local.get('entities', ())
+        for s in reversed(entities):
+            if s.thread_id == tid:
+                return s
+            # custodian main thread won't advance (create new segment)
+            # with worker threads still doing pool work.
+            elif s.thread_id == self._main_tid:
+                return s
+        return self.handle_context_missing()
+
 
 @tracer_outputs.register('xray', condition=HAVE_XRAY)
-class XrayTracer(object):
+class XrayTracer:
 
     emitter = XrayEmitter()
 
@@ -335,12 +389,13 @@ class XrayTracer(object):
     service_name = 'custodian'
 
     @classmethod
-    def initialize(cls):
+    def initialize(cls, config):
         context = XrayContext()
+        sampling = config.get('sample', 'true') == 'true' and True or False
         xray_recorder.configure(
             emitter=cls.use_daemon is False and cls.emitter or None,
             context=context,
-            sampling=True,
+            sampling=sampling,
             context_missing='LOG_ERROR')
         patch(['boto3', 'requests'])
         logging.getLogger('aws_xray_sdk.core').setLevel(logging.ERROR)
@@ -391,6 +446,9 @@ class XrayTracer(object):
         xray_recorder.end_segment()
         if not self.use_daemon:
             self.emitter.flush()
+            log.info(
+                ('View XRay Trace https://console.aws.amazon.com/xray/home?region=%s#/'
+                 'traces/%s' % (self.ctx.options.region, self.segment.trace_id)))
         self.metadata.clear()
 
 
@@ -517,7 +575,7 @@ class AWS(Provider):
         _default_region(options)
         _default_account_id(options)
         if options.tracer and options.tracer.startswith('xray') and HAVE_XRAY:
-            XrayTracer.initialize()
+            XrayTracer.initialize(utils.parse_url_config(options.tracer))
 
         return options
 
@@ -532,7 +590,7 @@ class AWS(Provider):
         """Return a set of policies targetted to the given regions.
 
         Supports symbolic regions like 'all'. This will automatically
-        filter out policies if their being targetted to a region that
+        filter out policies if they are being targetted to a region that
         does not support the service. Global services will target a
         single region (us-east-1 if only all specified, else first
         region in the list).
@@ -584,8 +642,7 @@ class AWS(Provider):
 
                 if len(options.regions) > 1 or 'all' in options.regions and getattr(
                         options, 'output_dir', None):
-                    options_copy.output_dir = (
-                        options.output_dir.rstrip('/') + '/%s' % region)
+                    options_copy.output_dir = join_output(options.output_dir, region)
                 policies.append(
                     Policy(p.data, options_copy,
                            session_factory=policy_collection.session_factory()))
@@ -596,6 +653,14 @@ class AWS(Provider):
             # is stable.
             sorted(policies, key=operator.attrgetter('options.region')),
             options)
+
+
+def join_output(output_dir, suffix):
+    if '{region}' in output_dir:
+        return output_dir.rstrip('/')
+    if output_dir.endswith('://'):
+        return output_dir + suffix
+    return output_dir.rstrip('/') + '/%s' % suffix
 
 
 def fake_session():
