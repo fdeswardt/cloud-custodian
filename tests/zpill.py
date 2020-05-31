@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import fnmatch
+from io import StringIO
 import json
 import os
 import shutil
@@ -24,7 +25,6 @@ import boto3
 import placebo
 from botocore.response import StreamingBody
 from placebo import pill
-from six import StringIO
 
 from c7n.testing import CustodianTestCore
 
@@ -125,12 +125,10 @@ class BluePill(pill.Pill):
         self._avail = self.get_available()
 
     def get_available(self):
-        return set(
-            [
-                os.path.join(self.data_path, n)
-                for n in fnmatch.filter(os.listdir(self.data_path), "*.json")
-            ]
-        )
+        return {
+            os.path.join(self.data_path, n)
+            for n in fnmatch.filter(os.listdir(self.data_path), "*.json")
+        }
 
     def get_next_file_path(self, service, operation):
         fn, format = super(BluePill, self).get_next_file_path(service, operation)
@@ -165,7 +163,7 @@ class ZippedPill(pill.Pill):
         self.archive = zipfile.ZipFile(self.path, "a", zipfile.ZIP_DEFLATED)
         self._files = set()
 
-        files = set([n for n in self.archive.namelist() if n.startswith(self.prefix)])
+        files = {n for n in self.archive.namelist() if n.startswith(self.prefix)}
 
         if not files:
             return super(ZippedPill, self).record()

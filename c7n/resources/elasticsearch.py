@@ -11,15 +11,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import itertools
+import jmespath
 
 from c7n.actions import Action, ModifyVpcSecurityGroupsAction
 from c7n.filters import MetricsFilter
 from c7n.filters.vpc import SecurityGroupFilter, SubnetFilter, VpcFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, TypeInfo
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.utils import chunks, local_session, type_schema
 from c7n.tags import Tag, RemoveTag, TagActionFilter, TagDelayedAction
+
+from .securityhub import PostFinding
+
+
+class DescribeDomain(DescribeSource):
+
+    def get_resources(self, resource_ids):
+        client = local_session(self.manager.session_factory).client('es')
+        return client.describe_elasticsearch_domains(
+            DomainNames=resource_ids)['DomainStatusList']
+
+    def augment(self, domains):
+        client = local_session(self.manager.session_factory).client('es')
+        model = self.manager.get_model()
+        results = []
+
+        def _augment(resource_set):
+            resources = self.manager.retry(
+                client.describe_elasticsearch_domains,
+                DomainNames=resource_set)['DomainStatusList']
+            for r in resources:
+                rarn = self.manager.generate_arn(r[model.id])
+                r['Tags'] = self.manager.retry(
+                    client.list_tags, ARN=rarn).get('TagList', [])
+            return resources
+
+        for resource_set in chunks(domains, 5):
+            results.extend(_augment(resource_set))
+
+        return results
 
 
 @resources.register('elasticsearch')
@@ -34,29 +64,12 @@ class ElasticSearchDomain(QueryResourceManager):
         id = 'DomainName'
         name = 'Name'
         dimension = "DomainName"
+        cfn_type = config_type = 'AWS::Elasticsearch::Domain'
 
-    def get_resources(self, resource_ids):
-        client = local_session(self.session_factory).client('es')
-        return client.describe_elasticsearch_domains(
-            DomainNames=resource_ids)['DomainStatusList']
-
-    def augment(self, domains):
-        client = local_session(self.session_factory).client('es')
-        model = self.get_model()
-
-        def _augment(resource_set):
-            resources = self.retry(
-                client.describe_elasticsearch_domains,
-                DomainNames=resource_set)['DomainStatusList']
-            for r in resources:
-                rarn = self.generate_arn(r[model.id])
-                r['Tags'] = self.retry(
-                    client.list_tags, ARN=rarn).get('TagList', [])
-            return resources
-
-        with self.executor_factory(max_workers=1) as w:
-            return list(itertools.chain(
-                *w.map(_augment, chunks(domains, 5))))
+    source_mapping = {
+        'describe': DescribeDomain,
+        'config': ConfigSource
+    }
 
 
 ElasticSearchDomain.filter_registry.register('marked-for-op', TagActionFilter)
@@ -88,6 +101,48 @@ class Metrics(MetricsFilter):
                  'Value': self.manager.account_id},
                 {'Name': 'DomainName',
                  'Value': resource['DomainName']}]
+
+
+@ElasticSearchDomain.action_registry.register('post-finding')
+class ElasticSearchPostFinding(PostFinding):
+
+    resource_type = 'AwsElasticsearchDomain'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(self.filter_empty({
+            'AccessPolicies': r.get('AccessPolicies'),
+            'DomainId': r['DomainId'],
+            'DomainName': r['DomainName'],
+            'Endpoint': r.get('Endpoint'),
+            'Endpoints': r.get('Endpoints'),
+            'DomainEndpointOptions': self.filter_empty({
+                'EnforceHTTPS': jmespath.search(
+                    'DomainEndpointOptions.EnforceHTTPS', r),
+                'TLSSecurityPolicy': jmespath.search(
+                    'DomainEndpointOptions.TLSSecurityPolicy', r)
+            }),
+            'ElasticsearchVersion': r['ElasticsearchVersion'],
+            'EncryptionAtRestOptions': self.filter_empty({
+                'Enabled': jmespath.search(
+                    'EncryptionAtRestOptions.Enabled', r),
+                'KmsKeyId': jmespath.search(
+                    'EncryptionAtRestOptions.KmsKeyId', r)
+            }),
+            'NodeToNodeEncryptionOptions': self.filter_empty({
+                'Enabled': jmespath.search(
+                    'NodeToNodeEncryptionOptions.Enabled', r)
+            }),
+            'VPCOptions': self.filter_empty({
+                'AvailabilityZones': jmespath.search(
+                    'VPCOptions.AvailabilityZones', r),
+                'SecurityGroupIds': jmespath.search(
+                    'VPCOptions.SecurityGroupIds', r),
+                'SubnetIds': jmespath.search('VPCOptions.SubnetIds', r),
+                'VPCId': jmespath.search('VPCOptions.VPCId', r)
+            })
+        }))
+        return envelope
 
 
 @ElasticSearchDomain.action_registry.register('modify-security-groups')

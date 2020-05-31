@@ -170,16 +170,14 @@ class HealthCheckProtocolMismatchTest(BaseTest):
         self.assertEqual(len(resources), 3)
 
         # make sure we matched the right load balcners
-        elb_names = set([elb["LoadBalancerName"] for elb in resources])
+        elb_names = {elb["LoadBalancerName"] for elb in resources}
         self.assertEqual(
             elb_names,
-            set(
-                [
-                    "test-elb-no-listeners",
-                    "test-elb-protocol-matches",
-                    "test-elb-multiple-listeners",
-                ]
-            ),
+            {
+                "test-elb-no-listeners",
+                "test-elb-protocol-matches",
+                "test-elb-multiple-listeners",
+            },
         )
 
 

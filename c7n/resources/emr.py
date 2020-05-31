@@ -13,8 +13,7 @@
 # limitations under the License.
 import logging
 import time
-
-import six
+import json
 
 from c7n.actions import ActionRegistry, BaseAction
 from c7n.exceptions import PolicyValidationError
@@ -47,6 +46,7 @@ class EMRCluster(QueryResourceManager):
         name = 'Name'
         id = 'Id'
         date = "Status.Timeline.CreationDateTime"
+        cfn_type = 'AWS::EMR::Cluster'
 
     action_registry = actions
     filter_registry = filters
@@ -239,7 +239,7 @@ class Terminate(BaseAction):
 
 
 # Valid EMR Query Filters
-EMR_VALID_FILTERS = set(('CreatedAfter', 'CreatedBefore', 'ClusterStates'))
+EMR_VALID_FILTERS = {'CreatedAfter', 'CreatedBefore', 'ClusterStates'}
 
 
 class QueryFilter:
@@ -280,7 +280,46 @@ class QueryFilter:
 
     def query(self):
         value = self.value
-        if isinstance(self.value, six.string_types):
+        if isinstance(self.value, str):
             value = [self.value]
 
         return {'Name': self.key, 'Values': value}
+
+
+@resources.register('emr-security-configuration')
+class EMRSecurityConfiguration(QueryResourceManager):
+    """Resource manager for EMR Security Configuration
+    """
+
+    class resource_type(TypeInfo):
+        service = 'emr'
+        arn_type = 'emr'
+        permission_prefix = 'elasticmapreduce'
+        enum_spec = ('list_security_configurations', 'SecurityConfigurations', None)
+        detail_spec = ('describe_security_configuration', 'Name', 'Name', None)
+        id = name = 'Name'
+        cfn_type = 'AWS::EMR::SecurityConfiguration'
+
+    permissions = ('elasticmapreduce:ListSecurityConfigurations',
+                  'elasticmapreduce:DescribeSecurityConfiguration',)
+
+    def augment(self, resources):
+        resources = super().augment(resources)
+        for r in resources:
+            r['SecurityConfiguration'] = json.loads(r['SecurityConfiguration'])
+        return resources
+
+
+@EMRSecurityConfiguration.action_registry.register('delete')
+class DeleteEMRSecurityConfiguration(BaseAction):
+
+    schema = type_schema('delete')
+    permissions = ('elasticmapreduce:DeleteSecurityConfiguration',)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('emr')
+        for r in resources:
+            try:
+                client.delete_security_configuration(Name=r['Name'])
+            except client.exceptions.EntityNotFoundException:
+                continue

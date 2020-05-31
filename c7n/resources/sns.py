@@ -17,10 +17,28 @@ from c7n.actions import RemovePolicyBase, ModifyPolicyBase, BaseAction
 from c7n.filters import CrossAccountAccessFilter, PolicyChecker
 from c7n.filters.kms import KmsRelatedFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, TypeInfo
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.resolver import ValuesFrom
 from c7n.utils import local_session, type_schema
 from c7n.tags import RemoveTag, Tag, TagDelayedAction, TagActionFilter
+
+from c7n.resources.securityhub import PostFinding
+
+
+class DescribeTopic(DescribeSource):
+
+    def augment(self, resources):
+        client = local_session(self.manager.session_factory).client('sns')
+
+        def _augment(r):
+            tags = self.manager.retry(client.list_tags_for_resource,
+                ResourceArn=r['TopicArn'])['Tags']
+            r['Tags'] = tags
+            return r
+
+        resources = super().augment(resources)
+        with self.manager.executor_factory(max_workers=3) as w:
+            return list(w.map(_augment, resources))
 
 
 @resources.register('sns')
@@ -35,6 +53,7 @@ class SNS(QueryResourceManager):
         id = 'TopicArn'
         name = 'DisplayName'
         dimension = 'TopicName'
+        cfn_type = 'AWS::SNS::Topic'
         default_report_fields = (
             'TopicArn',
             'DisplayName',
@@ -44,22 +63,28 @@ class SNS(QueryResourceManager):
         )
 
     permissions = ('sns:ListTagsForResource',)
-
-    def augment(self, resources):
-        client = local_session(self.session_factory).client('sns')
-
-        def _augment(r):
-            tags = self.retry(client.list_tags_for_resource,
-                ResourceArn=r['TopicArn'])['Tags']
-            r['Tags'] = tags
-            return r
-
-        resources = super(SNS, self).augment(resources)
-        with self.executor_factory(max_workers=3) as w:
-            return list(w.map(_augment, resources))
+    source_mapping = {
+        'describe': DescribeTopic,
+        'config': ConfigSource
+    }
 
 
 SNS.filter_registry.register('marked-for-op', TagActionFilter)
+
+
+@SNS.action_registry.register('post-finding')
+class SNSPostFinding(PostFinding):
+
+    resource_type = 'AwsSnsTopic'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(
+            self.filter_empty({
+                'KmsMasterKeyId': r.get('KmsMasterKeyId'),
+                'Owner': r['Owner'],
+                'TopicName': r['TopicArn'].rsplit(':', 1)[-1]}))
+        return envelope
 
 
 @SNS.action_registry.register('tag')

@@ -54,8 +54,7 @@ def test_generate_requirements():
     for l in lines.split('\n'):
         pkg_name, version = l.split('==')
         packages.append(pkg_name)
-    assert set(packages) == set([
-        'botocore', 'jmespath', 'python-dateutil'])
+    assert set(packages) == {'botocore', 'jmespath', 'python-dateutil'}
 
 
 class Publish(BaseTest):
@@ -148,6 +147,33 @@ class PolicyLambdaProvision(BaseTest):
         self.assertEqual(result["FunctionName"], "custodian-sg-modified")
         self.addCleanup(mgr.remove, pl)
 
+    def test_config_poll_rule_evaluation(self):
+        session_factory = self.record_flight_data("test_config_poll_rule_provision")
+        p = self.load_policy({
+            'name': 'configx',
+            'resource': 'aws.kinesis',
+            'mode': {
+                'schedule': 'Three_Hours',
+                'type': 'config-poll-rule'}})
+        mu_policy = PolicyLambda(p)
+        mu_policy.arn = "arn:aws:lambda:us-east-1:644160558196:function:CloudCustodian"
+        events = mu_policy.get_events(session_factory)
+        self.assertEqual(len(events), 1)
+        config_rule = events.pop()
+        self.assertEqual(
+            config_rule.get_rule_params(mu_policy),
+
+            {'ConfigRuleName': 'custodian-configx',
+             'Description': 'cloud-custodian lambda policy',
+             'MaximumExecutionFrequency': 'Three_Hours',
+             'Scope': {'ComplianceResourceTypes': ['AWS::Kinesis::Stream']},
+             'Source': {
+                 'Owner': 'CUSTOM_LAMBDA',
+                 'SourceDetails': [{'EventSource': 'aws.config',
+                                    'MessageType': 'ScheduledNotification'}],
+                 'SourceIdentifier': 'arn:aws:lambda:us-east-1:644160558196:function:CloudCustodian'} # noqa
+             })
+
     def test_config_rule_evaluation(self):
         session_factory = self.replay_flight_data("test_config_rule_evaluate")
         p = self.load_policy(
@@ -202,6 +228,35 @@ class PolicyLambdaProvision(BaseTest):
                 'eventTypeCode': ['AWS_EC2_PERSISTENT_INSTANCE_RETIREMENT_SCHEDULED']},
              'source': ['aws.health']}
         )
+
+    def test_cloudtrail_delay(self):
+        p = self.load_policy({
+            'name': 'aws-account',
+            'resource': 'aws.account',
+            'mode': {
+                'type': 'cloudtrail',
+                'delay': 32,
+                'role': 'CustodianRole',
+                'events': ['RunInstances']}})
+        from c7n import policy
+
+        class time:
+
+            invokes = []
+
+            @classmethod
+            def sleep(cls, duration):
+                cls.invokes.append(duration)
+
+        self.patch(policy, 'time', time)
+        trail_mode = p.get_execution_mode()
+        results = trail_mode.run({
+            'detail': {
+                'eventSource': 'ec2.amazonaws.com',
+                'eventName': 'RunInstances'}},
+            None)
+        self.assertEqual(len(results), 0)
+        self.assertEqual(time.invokes, [32])
 
     def test_user_pattern_merge(self):
         p = self.load_policy({

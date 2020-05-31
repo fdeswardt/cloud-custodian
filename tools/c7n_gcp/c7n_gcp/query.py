@@ -14,8 +14,8 @@
 
 import jmespath
 import json
+import itertools
 import logging
-import six
 
 from googleapiclient.errors import HttpError
 
@@ -23,7 +23,7 @@ from c7n.actions import ActionRegistry
 from c7n.filters import FilterRegistry
 from c7n.manager import ResourceManager
 from c7n.query import sources, MaxResourceLimit
-from c7n.utils import local_session
+from c7n.utils import local_session, chunks
 
 
 log = logging.getLogger('c7n_gcp.query')
@@ -92,6 +92,50 @@ class DescribeSource:
         return resources
 
 
+@sources.register('inventory')
+class AssetInventory:
+
+    permissions = ("cloudasset.assets.searchAllResources",
+                   "cloudasset.assets.exportResource")
+
+    def __init__(self, manager):
+        self.manager = manager
+
+    def get_resources(self, query):
+        session = local_session(self.manager.session_factory)
+        if query is None:
+            query = {}
+        if 'scope' not in query:
+            query['scope'] = 'projects/%s' % session.get_default_project()
+        if 'assetTypes' not in query:
+            query['assetTypes'] = [self.manager.resource_type.asset_type]
+
+        search_client = session.client('cloudasset', 'v1p1beta1', 'resources')
+        resource_client = session.client('cloudasset', 'v1', 'v1')
+        resources = []
+
+        results = list(search_client.execute_paged_query('searchAll', query))
+        for resource_set in chunks(itertools.chain(*[rs['results'] for rs in results]), 100):
+            rquery = {
+                'parent': query['scope'],
+                'contentType': 'RESOURCE',
+                'assetNames': [r['name'] for r in resource_set]}
+            for history_result in resource_client.execute_query(
+                    'batchGetAssetsHistory', rquery).get('assets', ()):
+                resource = history_result['asset']['resource']['data']
+                resource['c7n:history'] = {
+                    'window': history_result['window'],
+                    'ancestors': history_result['asset']['ancestors']}
+                resources.append(resource)
+        return resources
+
+    def get_permissions(self):
+        return self.permissions
+
+    def augment(self, resources):
+        return resources
+
+
 class QueryMeta(type):
     """metaclass to have consistent action/filter registry for new resources."""
     def __new__(cls, name, parents, attrs):
@@ -105,8 +149,7 @@ class QueryMeta(type):
         return super(QueryMeta, cls).__new__(cls, name, parents, attrs)
 
 
-@six.add_metaclass(QueryMeta)
-class QueryResourceManager(ResourceManager):
+class QueryResourceManager(ResourceManager, metaclass=QueryMeta):
 
     def __init__(self, data, options):
         super(QueryResourceManager, self).__init__(data, options)
@@ -257,8 +300,7 @@ class TypeMeta(type):
             cls.version)
 
 
-@six.add_metaclass(TypeMeta)
-class TypeInfo:
+class TypeInfo(metaclass=TypeMeta):
 
     # api client construction information
     service = None
@@ -286,6 +328,9 @@ class TypeInfo:
     id = None
     name = None
     default_report_fields = ()
+
+    # cloud asset inventory type
+    asset_type = None
 
 
 class ChildTypeInfo(TypeInfo):

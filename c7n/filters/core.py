@@ -22,20 +22,20 @@ import ipaddress
 import logging
 import operator
 import re
-import sys
 import os
 
 from dateutil.tz import tzutc
 from dateutil.parser import parse
 from distutils import version
 import jmespath
-import six
 
+from c7n.element import Element
 from c7n.exceptions import PolicyValidationError
 from c7n.executor import ThreadPoolExecutor
 from c7n.registry import PluginRegistry
 from c7n.resolver import ValuesFrom
 from c7n.utils import set_annotation, type_schema, parse_cidr
+from c7n.manager import iter_filters
 
 
 class FilterValidationError(Exception):
@@ -47,13 +47,13 @@ ANNOTATION_KEY = "c7n:MatchedFilters"
 
 
 def glob_match(value, pattern):
-    if not isinstance(value, six.string_types):
+    if not isinstance(value, str):
         return False
     return fnmatch.fnmatch(value, pattern)
 
 
 def regex_match(value, regex):
-    if not isinstance(value, six.string_types):
+    if not isinstance(value, str):
         return False
     # Note python 2.5+ internally cache regex
     # would be nice to use re2
@@ -61,7 +61,7 @@ def regex_match(value, regex):
 
 
 def regex_case_sensitive_match(value, regex):
-    if not isinstance(value, six.string_types):
+    if not isinstance(value, str):
         return False
     # Note python 2.5+ internally cache regex
     # would be nice to use re2
@@ -141,13 +141,13 @@ class FilterRegistry(PluginRegistry):
         if isinstance(data, dict) and len(data) == 1 and 'type' not in data:
             op = list(data.keys())[0]
             if op == 'or':
-                return Or(data, self, manager)
+                return self['or'](data, self, manager)
             elif op == 'and':
-                return And(data, self, manager)
+                return self['and'](data, self, manager)
             elif op == 'not':
-                return Not(data, self, manager)
+                return self['not'](data, self, manager)
             return ValueFilter(data, manager)
-        if isinstance(data, six.string_types):
+        if isinstance(data, str):
             filter_type = data
             data = {'type': data}
         else:
@@ -165,10 +165,30 @@ class FilterRegistry(PluginRegistry):
                     self.plugin_type, data))
 
 
+def trim_runtime(filters):
+    """Remove runtime filters.
+
+    Some filters can only be effectively evaluated at policy
+    execution, ie. event filters.
+
+    When evaluating conditions for dryrun or provisioning stages we
+    remove them.
+    """
+    def remove_filter(f):
+        block = f.get_block_parent()
+        block.filters.remove(f)
+        if isinstance(block, BooleanGroupFilter) and not len(block):
+            remove_filter(block)
+
+    for f in iter_filters(filters):
+        if isinstance(f, EventFilter):
+            remove_filter(f)
+
+
 # Really should be an abstract base class (abc) or
 # zope.interface
 
-class Filter:
+class Filter(Element):
 
     executor_factory = ThreadPoolExecutor
 
@@ -199,16 +219,21 @@ class Filter:
     def get_block_operator(self):
         """Determine the immediate parent boolean operator for a filter"""
         # Top level operator is `and`
-        block_stack = ['and']
+        block = self.get_block_parent()
+        if block.type in ('and', 'or', 'not'):
+            return block.type
+        return 'and'
+
+    def get_block_parent(self):
+        """Get the block parent for a filter"""
+        block_stack = [self.manager]
         for f in self.manager.iter_filters(block_end=True):
             if f is None:
                 block_stack.pop()
-                continue
-            if f.type in ('and', 'or', 'not'):
-                block_stack.append(f.type)
-            if f == self:
-                break
-        return block_stack[-1]
+            elif f == self:
+                return block_stack[-1]
+            elif f.type in ('and', 'or', 'not'):
+                block_stack.append(f)
 
     def merge_annotation(self, r, annotation_key, values):
         block_op = self.get_block_operator()
@@ -249,6 +274,12 @@ class BooleanGroupFilter(Filter):
     def get_resource_type_id(self):
         resource_type = self.manager.get_model()
         return resource_type.id
+
+    def __len__(self):
+        return len(self.filters)
+
+    def __bool__(self):
+        return True
 
 
 class Or(BooleanGroupFilter):
@@ -320,7 +351,7 @@ class Not(BooleanGroupFilter):
                 break
 
         before = set(resource_map.keys())
-        after = set([r[rtype_id] for r in resources])
+        after = {r[rtype_id] for r in resources}
         results = before - after
         sweeper.sweep([])
 
@@ -389,7 +420,7 @@ class ValueFilter(Filter):
     }
     schema_alias = True
     annotate = True
-    required_keys = set(('value', 'key'))
+    required_keys = {'value', 'key'}
 
     def __init__(self, data, manager=None):
         super(ValueFilter, self).__init__(data, manager)
@@ -578,7 +609,7 @@ class ValueFilter(Filter):
         return False
 
     def process_value_type(self, sentinel, value, resource):
-        if self.vtype == 'normalize' and isinstance(value, six.string_types):
+        if self.vtype == 'normalize' and isinstance(value, str):
             return sentinel, value.strip().lower()
 
         elif self.vtype == 'expr':
@@ -715,12 +746,6 @@ class EventFilter(ValueFilter):
         return []
 
 
-def cast_tz(d, tz):
-    if sys.version_info.major == 2:
-        return d.replace(tzinfo=tz)
-    return d.astimezone(tz)
-
-
 def parse_date(v, tz=None):
     if v is None:
         return v
@@ -729,28 +754,28 @@ def parse_date(v, tz=None):
 
     if isinstance(v, datetime.datetime):
         if v.tzinfo is None:
-            return cast_tz(v, tz)
+            return v.astimezone(tz)
         return v
 
-    if isinstance(v, six.string_types):
+    if isinstance(v, str):
         try:
-            return cast_tz(parse(v), tz)
+            return parse(v).astimezone(tz)
         except (AttributeError, TypeError, ValueError, OverflowError):
             pass
 
     # OSError on windows -- https://bugs.python.org/issue36439
     exceptions = (ValueError, OSError) if os.name == "nt" else (ValueError)
 
-    if isinstance(v, (int, float) + six.string_types):
+    if isinstance(v, (int, float, str)):
         try:
-            v = cast_tz(datetime.datetime.fromtimestamp(float(v)), tz)
+            v = datetime.datetime.fromtimestamp(float(v)).astimezone(tz)
         except exceptions:
             pass
 
-    if isinstance(v, (int, float) + six.string_types):
+    if isinstance(v, (int, float, str)):
         try:
             # try interpreting as milliseconds epoch
-            v = cast_tz(datetime.datetime.fromtimestamp(float(v) / 1000), tz)
+            v = datetime.datetime.fromtimestamp(float(v) / 1000).astimezone(tz)
         except exceptions:
             pass
 
@@ -791,17 +816,3 @@ class ValueRegex:
         if capture is None:  # regex didn't capture anything
             return None
         return capture.group(1)
-
-
-class StateTransitionFilter(Filter):
-    valid_origin_states = ()
-
-    def filter_resource_state(self, resources, event=None):
-        state_key = self.manager.get_model().state_key
-        states = self.valid_origin_states
-        orig_length = len(resources)
-        results = [r for r in resources if r[state_key] in states]
-        self.log.info("filtered %d of %d %s resources with  %s states" % (
-            len(results), orig_length, self.__class__.__name__, states))
-
-        return results

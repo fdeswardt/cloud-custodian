@@ -390,16 +390,16 @@ class AccountTests(BaseTest):
             resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertEqual(
-            set([l["service"] for l in resources[0]["c7n:ServiceLimitsExceeded"]]),
-            set(["RDS"]),
+            {l["service"] for l in resources[0]["c7n:ServiceLimitsExceeded"]},
+            {"RDS"},
         )
         self.assertEqual(
-            set([l["region"] for l in resources[0]["c7n:ServiceLimitsExceeded"]]),
-            set(["us-east-1"]),
+            {l["region"] for l in resources[0]["c7n:ServiceLimitsExceeded"]},
+            {"us-east-1"},
         )
         self.assertEqual(
-            set([l["check"] for l in resources[0]["c7n:ServiceLimitsExceeded"]]),
-            set(["DB instances"]),
+            {l["check"] for l in resources[0]["c7n:ServiceLimitsExceeded"]},
+            {"DB instances"},
         )
         self.assertEqual(len(resources[0]["c7n:ServiceLimitsExceeded"]), 1)
 
@@ -421,8 +421,8 @@ class AccountTests(BaseTest):
             resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertEqual(
-            set([l["service"] for l in resources[0]["c7n:ServiceLimitsExceeded"]]),
-            set(["IAM"]),
+            {l["service"] for l in resources[0]["c7n:ServiceLimitsExceeded"]},
+            {"IAM"},
         )
         self.assertEqual(len(resources[0]["c7n:ServiceLimitsExceeded"]), 2)
 
@@ -959,13 +959,62 @@ class AccountTests(BaseTest):
 
         self.assertEqual(len(resources), 1)
 
+    def test_get_emr_block_public_access_configuration(self):
+        session_factory = self.replay_flight_data("test_emr_block_public_access_configuration")
+        p = self.load_policy(
+            {
+                'name': 'get-emr-block-public-access-configuration',
+                'resource': 'account',
+                'filters': [{
+                    'type': 'emr-block-public-access',
+                    'key': 'BlockPublicAccessConfiguration',
+                    'value': 'not-null'
+                }]
+            },
+            session_factory=session_factory)
+
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["c7n:emr-block-public-access"]
+            ['BlockPublicAccessConfigurationMetadata']['CreatedByArn'],
+            "arn:aws:iam::12345678901:user/test")
+
+    def test_set_emr_block_public_access_configuration(self):
+        session_factory = self.replay_flight_data("test_set_emr_block_public_access_configuration")
+        p = self.load_policy(
+            {
+                'name': 'emr',
+                'resource': 'account',
+                'actions': [{
+                    "type": "set-emr-block-public-access",
+                    "config": {
+                        "BlockPublicSecurityGroupRules": True,
+                        "PermittedPublicSecurityGroupRuleRanges": [{
+                            "MinRange": 23,
+                            "MaxRange": 23,
+                        }]
+                    }
+                }],
+            },
+            session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        client = local_session(session_factory).client("emr")
+        resp = client.get_block_public_access_configuration()
+
+        self.assertEqual(resp["BlockPublicAccessConfiguration"]
+            ["PermittedPublicSecurityGroupRuleRanges"][0]['MinRange'], 23)
+        self.assertEqual(resp["BlockPublicAccessConfiguration"]
+            ["PermittedPublicSecurityGroupRuleRanges"][0]['MaxRange'], 23)
+
 
 class AccountDataEvents(BaseTest):
 
     def make_bucket(self, session_factory, name):
         client = session_factory().client("s3")
 
-        buckets = set([b["Name"] for b in client.list_buckets()["Buckets"]])
+        buckets = {b["Name"] for b in client.list_buckets()["Buckets"]}
         if name in buckets:
             self.destroyBucket(client, name)
 

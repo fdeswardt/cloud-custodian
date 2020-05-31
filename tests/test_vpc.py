@@ -867,6 +867,27 @@ class NetworkAddrTest(BaseTest):
         self.addCleanup(self.release_if_still_present, ec2, network_addr)
         self.assert_policy_released(factory, ec2, network_addr)
 
+    def test_elasticip_error(self):
+        mock_factory = MagicMock()
+        mock_factory.region = 'us-east-1'
+        mock_factory().client('ec2').release_address.side_effect = BotoClientError(
+            {'Error': {'Code': 'xyz'}},
+            operation_name='release_address')
+
+        p = self.load_policy(
+            {
+                "name": "release-network-addr",
+                "resource": "network-addr",
+                "actions": [{"type": "release", "force": False}],
+            },
+            session_factory=mock_factory,
+        )
+        with self.assertRaises(BotoClientError):
+            p.resource_manager.actions[0].process([{
+                'PublicIp': "52.207.185.218",
+                'Domain': 'Vpc',
+                'AllocationId': 'eipalloc-bbaf95b2'}])
+
     def test_elasticip_alias(self):
         try:
             self.load_policy({'name': 'eip', 'resource': 'aws.elastic-ip'}, validate=True)
@@ -1122,8 +1143,8 @@ class SecurityGroupTest(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 3)
         self.assertEqual(
-            set(["sg-f9cc4d9f", "sg-13de8f75", "sg-ce548cb7"]),
-            set([r["GroupId"] for r in resources]),
+            {"sg-f9cc4d9f", "sg-13de8f75", "sg-ce548cb7"},
+            {r["GroupId"] for r in resources},
         )
 
     def test_unused_ecs(self):
@@ -2725,6 +2746,7 @@ class FlowLogsTest(BaseTest):
 
     def test_vpc_create_flow_logs(self):
         session_factory = self.replay_flight_data("test_vpc_create_flow_logs")
+        # creates log group
         p = self.load_policy(
             {
                 "name": "c7n-create-vpc-flow-logs",
@@ -2737,7 +2759,7 @@ class FlowLogsTest(BaseTest):
                     {
                         "type": "set-flow-log",
                         "DeliverLogsPermissionArn": "arn:aws:iam::644160558196:role/flowlogsRole",
-                        "LogGroupName": "/custodian/vpc_logs/",
+                        "LogGroupName": "/custodian/vpc_log/",
                         "TrafficType": "ALL",
                     }
                 ],
@@ -2746,14 +2768,40 @@ class FlowLogsTest(BaseTest):
         )
         resources = p.run()
         self.assertEqual(len(resources), 1)
-        self.assertEqual(resources[0]["VpcId"], "vpc-7af45101")
+        self.assertEqual(resources[0]["VpcId"], "vpc-d2d616b5")
         client = session_factory(region="us-east-1").client("ec2")
         logs = client.describe_flow_logs(
             Filters=[{"Name": "resource-id", "Values": [resources[0]["VpcId"]]}]
-        )[
-            "FlowLogs"
-        ]
+        )["FlowLogs"]
         self.assertEqual(logs[0]["ResourceId"], resources[0]["VpcId"])
+        # p1 has same log group name
+        p1 = self.load_policy(
+            {
+                "name": "c7n-create-vpc-flow-logs",
+                "resource": "vpc",
+                "filters": [
+                    {"tag:Name": "testing-vpc"},
+                    {"type": "flow-logs", "enabled": False}
+                ],
+                "actions": [
+                    {
+                        "type": "set-flow-log",
+                        "DeliverLogsPermissionArn": "arn:aws:iam::644160558196:role/flowlogsRole",
+                        "LogGroupName": "/custodian/vpc_log/",
+                        "TrafficType": "ALL",
+                    }
+                ],
+            },
+            session_factory=session_factory,
+        )
+        res = p1.run()
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["VpcId"], "vpc-03005fb9b8740263d")
+        client = session_factory(region="us-east-1").client("ec2")
+        lgs = client.describe_flow_logs(
+            Filters=[{"Name": "resource-id", "Values": [res[0]["VpcId"]]}]
+        )["FlowLogs"]
+        self.assertEqual(lgs[0]["ResourceId"], res[0]["VpcId"])
 
     def test_vpc_flow_log_destination(self):
         session_factory = self.replay_flight_data('test_vpc_flow_filter_destination')
@@ -2902,3 +2950,77 @@ class FlowLogsTest(BaseTest):
             "FlowLogs"
         ]
         self.assertEqual(logs[0]["MaxAggregationInterval"], 60)
+
+
+class TestUnusedKeys(BaseTest):
+    def test_vpc_unused_keys(self):
+        session_factory = self.replay_flight_data("test_vpc_unused_key_delete")
+        client = session_factory().client('ec2')
+        instances = client.describe_instances(Filters=[
+            {
+                "Name": 'instance-state-name',
+                "Values": [
+                    "running"
+                ]
+            }
+        ])
+        self.assertEqual(len(instances['Reservations'][0]['Instances']), 1)
+        used_key = {instances['Reservations'][0]['Instances'][0]['KeyName']}
+        keys = {key['KeyName'] for key in client.describe_key_pairs()['KeyPairs']}
+        unused_key = keys - used_key
+        self.assertEqual(len(unused_key), 1)
+        self.assertNotEqual(unused_key, used_key)
+        p = self.load_policy(
+            {
+                "name": "unused-keys",
+                "resource": "aws.key-pair",
+                "filters": [
+                    {
+                        "type": "unused"
+                    },
+                ],
+                "actions": [
+                    {
+                        "type": "delete"
+                    },
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        keys = {key['KeyName'] for key in client.describe_key_pairs()['KeyPairs']}
+        self.assertIn(resources[0]['KeyName'], unused_key)
+        self.assertNotEqual(unused_key, keys)
+        self.assertEqual(used_key, keys)
+
+    def test_vpc_unused_key_not_filtered_error(self):
+        with self.assertRaises(PolicyValidationError):
+            self.load_policy(
+                {
+                    "name": "delete-unused-keys",
+                    "resource": "aws.key-pair",
+                    "actions": [
+                        {
+                            "type": "delete"
+                        },
+                    ]
+                }
+            )
+        with self.assertRaises(PolicyValidationError):
+            self.load_policy(
+                {
+                    "name": "delete-unused-keys",
+                    "resource": "aws.key-pair",
+                    "filters": [
+                        {
+                            "type": "unused",
+                            "state": False
+                        },
+                    ],
+                    "actions": [
+                        {
+                            "type": "delete"
+                        },
+                    ]
+                }
+            )

@@ -83,7 +83,9 @@ class ConfigCompliance(Filter):
                     # for multi resource type rules, only look at
                     # results for the resource type currently being
                     # processed.
-                    if rident['ResourceType'] != resource_model.config_type:
+                    if rident['ResourceType'] not in (
+                            resource_model.config_type,
+                            resource_model.cfn_type):
                         continue
 
                     if not filters:
@@ -107,11 +109,26 @@ class ConfigCompliance(Filter):
         resource_model = self.manager.get_model()
         resource_map = self.get_resource_map(filters, resource_model, resources)
 
+        # Avoid static/import time dep on boto in filters package
+        from c7n.resources.aws import Arn
         results = []
-        for r in resources:
-            if r[resource_model.id] not in resource_map:
+        for arn, r in zip(self.manager.get_arns(resources), resources):
+            # many aws provided rules are inconsistent in their
+            # treatment of resource ids, some use arns, some use names
+            # as identifiers for the same resource type. security
+            # hub in particular is bad at consistency.
+            rid = None
+            if arn in resource_map:
+                rid = arn
+            elif r[resource_model.id] in resource_map:
+                rid = r[resource_model.id]
+            if arn == r[resource_model.id] and not rid:
+                rid = Arn.parse(arn).resource
+                if rid not in resource_map:
+                    rid = None
+            if rid is None:
                 continue
-            r[self.annotation_key] = resource_map[r[resource_model.id]]
+            r[self.annotation_key] = resource_map[rid]
             results.append(r)
         return results
 
@@ -123,7 +140,8 @@ class ConfigCompliance(Filter):
         supported by aws config, automatically, register the
         config-compliance filter.
         """
-        if resource_class.resource_type.config_type is None:
+        if (resource_class.resource_type.cfn_type is None and
+                resource_class.resource_type.config_type is None):
             return
         resource_class.filter_registry.register('config-compliance', klass)
 

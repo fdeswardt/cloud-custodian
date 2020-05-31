@@ -83,43 +83,24 @@ class SecurityHubFindingFilter(Filter):
         resource_class.filter_registry.register('finding', klass)
 
 
-@execution.register('hub-action')
 @execution.register('hub-finding')
 class SecurityHub(LambdaMode):
-    """
-    Execute a policy lambda in response to security hub finding event or action.
+    """Deploy a policy lambda that executes on security hub finding ingestion events.
 
     .. example:
 
-    This policy will provision a lambda and security hub custom action.
-    The action can be invoked on a finding or insight result (collection
-    of findings). The action name will have the resource type prefixed as
-    custodian actions are resource specific.
+    This policy will provision a lambda that will process findings from
+    guard duty (note custodian also has support for guard duty events directly)
+    on iam users by removing access keys.
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
        policy:
          - name: remediate
-           resource: aws.ec2
+           resource: aws.iam-user
            mode:
-             type: hub-action
+             type: hub-finding
              role: MyRole
-           actions:
-            - snapshot
-            - type: set-instance-profile
-              name: null
-            - stop
-
-    .. example:
-
-    This policy will provision a lambda that will process high alert findings from
-    guard duty (note custodian also has support for guard duty events directly).
-
-    .. code-block: yaml
-
-       policy:
-         - name: remediate
-           resource: aws.iam
            filters:
              - type: event
                key: detail.findings[].ProductFields.aws/securityhub/ProductName
@@ -134,6 +115,7 @@ class SecurityHub(LambdaMode):
     so these modes work for resources that security hub doesn't natively support.
 
     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-cloudwatch-events.html
+
     """
 
     schema = type_schema(
@@ -213,7 +195,7 @@ class SecurityHub(LambdaMode):
             resource_sets.setdefault((rarn.account_id, rarn.region), []).append(rarn)
         # Warn if not configured for member-role and have multiple accounts resources.
         if (not self.policy.data['mode'].get('member-role') and
-                set((self.policy.options.account_id,)) != {
+                {self.policy.options.account_id} != {
                     rarn.account_id for rarn in resource_arns}):
             msg = ('hub-mode not configured for multi-account member-role '
                    'but multiple resource accounts found')
@@ -254,6 +236,34 @@ class SecurityHub(LambdaMode):
         return resources
 
 
+@execution.register('hub-action')
+class SecurityHubAction(SecurityHub):
+    """Deploys a policy lambda as a Security Hub Console Action.
+
+    .. example:
+
+    This policy will provision a lambda and security hub custom
+    action. The action can be invoked on a finding or insight result
+    (collection of findings) from within the console. The action name
+    will have the resource type prefixed as custodian actions are
+    resource specific.
+
+    .. code-block:: yaml
+
+       policy:
+         - name: remediate
+           resource: aws.ec2
+           mode:
+             type: hub-action
+             role: MyRole
+           actions:
+            - snapshot
+            - type: set-instance-profile
+              name: null
+            - stop
+    """
+
+
 FindingTypes = {
     "Software and Configuration Checks",
     "TTPs",
@@ -277,6 +287,9 @@ class PostFinding(Action):
     such that further findings generate updates.
 
     Example generate a finding for accounts that don't have shield enabled.
+
+    Note with Cloud Custodian (0.9+) you need to enable the Custodian integration
+    to post-findings, see Getting Started with :ref:`Security Hub <aws-securityhub>`.
 
     :example:
 
@@ -305,6 +318,8 @@ class PostFinding(Action):
     FindingVersion = "2018-10-08"
 
     permissions = ('securityhub:BatchImportFindings',)
+
+    resource_type = ""
 
     schema_alias = True
     schema = type_schema(
@@ -529,6 +544,20 @@ class PostFinding(Action):
 
         return filter_empty(finding)
 
+    def format_envelope(self, r):
+        details = {}
+        envelope = filter_empty({
+            'Id': self.manager.get_arns([r])[0],
+            'Region': self.manager.config.region,
+            'Tags': {t['Key']: t['Value'] for t in r.get('Tags', [])},
+            'Partition': get_partition(self.manager.config.region),
+            'Details': {self.resource_type: details},
+            'Type': self.resource_type
+        })
+        return envelope, details
+
+    filter_empty = staticmethod(filter_empty)
+
     def format_resource(self, r):
         raise NotImplementedError("subclass responsibility")
 
@@ -536,6 +565,7 @@ class PostFinding(Action):
 class OtherResourcePostFinding(PostFinding):
 
     fields = ()
+    resource_type = 'Other'
 
     def format_resource(self, r):
         details = {}
@@ -563,11 +593,11 @@ class OtherResourcePostFinding(PostFinding):
 
         details['c7n:resource-type'] = self.manager.type
         other = {
-            'Type': 'Other',
+            'Type': self.resource_type,
             'Id': self.manager.get_arns([r])[0],
             'Region': self.manager.config.region,
             'Partition': get_partition(self.manager.config.region),
-            'Details': {'Other': filter_empty(details)}
+            'Details': {self.resource_type: filter_empty(details)}
         }
         tags = {t['Key']: t['Value'] for t in r.get('Tags', [])}
         if tags:

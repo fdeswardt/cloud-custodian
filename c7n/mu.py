@@ -47,6 +47,7 @@ from c7n.utils import parse_s3, local_session, get_retry, merge_dict
 log = logging.getLogger('custodian.serverless')
 
 LambdaRetry = get_retry(('InsufficientPermissionsException',), max_attempts=2)
+RuleRetry = get_retry(('ResourceNotFoundException',), max_attempts=2)
 
 
 class PythonPackageArchive:
@@ -711,10 +712,10 @@ class LambdaFunction(AbstractLambdaFunction):
 
     def __init__(self, func_data, archive):
         self.func_data = func_data
-        required = set((
+        required = {
             'name', 'handler', 'memory_size',
             'timeout', 'role', 'runtime',
-            'description'))
+            'description'}
         missing = required.difference(func_data)
         if missing:
             raise ValueError("Missing required keys %s" % " ".join(missing))
@@ -885,7 +886,8 @@ class PolicyLambda(AbstractLambdaFunction):
 
     def get_events(self, session_factory):
         events = []
-        if self.policy.data['mode']['type'] == 'config-rule':
+        if self.policy.data['mode']['type'] in (
+                'config-rule', 'config-poll-rule'):
             events.append(
                 ConfigRule(self.policy.data['mode'], session_factory))
         elif self.policy.data['mode']['type'] == 'hub-action':
@@ -1113,7 +1115,7 @@ class CloudWatchEventSource:
 
         # Add Targets
         found = False
-        response = self.client.list_targets_by_rule(Rule=func.name)
+        response = RuleRetry(self.client.list_targets_by_rule, Rule=func.name)
         # CloudWatchE seems to be quite picky about function arns (no aliases/versions)
         func_arn = func.arn
 
@@ -1155,9 +1157,10 @@ class CloudWatchEventSource:
             try:
                 targets = self.client.list_targets_by_rule(
                     Rule=func.name)['Targets']
-                self.client.remove_targets(
-                    Rule=func.name,
-                    Ids=[t['Id'] for t in targets])
+                if targets:
+                    self.client.remove_targets(
+                        Rule=func.name,
+                        Ids=[t['Id'] for t in targets])
             except ClientError as e:
                 log.warning(
                     "Could not remove targets for rule %s error: %s",
@@ -1294,7 +1297,7 @@ class BucketLambdaNotification:
             params['SourceAccount'] = self.data['account_s3']
             params['SourceArn'] = 'arn:aws:s3:::*'
         else:
-            params['SourceArn'] = 'arn:aws:s3:::%' % self.bucket['Name']
+            params['SourceArn'] = 'arn:aws:s3:::%s' % self.bucket['Name']
         try:
             lambda_client.add_permission(**params)
         except lambda_client.exceptions.ResourceConflictException:
@@ -1603,8 +1606,11 @@ class ConfigRule:
 
         if isinstance(func, PolicyLambda):
             manager = func.policy.load_resource_manager()
-            if hasattr(manager.get_model(), 'config_type'):
-                config_type = manager.get_model().config_type
+            resource_model = manager.get_model()
+            if resource_model.config_type:
+                config_type = resource_model.config_type
+            elif resource_model.cfn_type and 'schedule' in self.data:
+                config_type = resource_model.cfn_type
             else:
                 raise Exception("You may have attempted to deploy a config "
                                 "based lambda function with an unsupported config type. "
@@ -1616,6 +1622,12 @@ class ConfigRule:
         else:
             params['Scope']['ComplianceResourceTypes'] = self.data.get(
                 'resource-types', ())
+        if self.data.get('schedule'):
+            params['Source']['SourceDetails'] = [{
+                'EventSource': 'aws.config',
+                'MessageType': 'ScheduledNotification'
+            }]
+            params['MaximumExecutionFrequency'] = self.data['schedule']
         return params
 
     def get(self, rule_name):
@@ -1635,6 +1647,9 @@ class ConfigRule:
         if rule['Scope'] != params['Scope']:
             return True
         if rule['Source'] != params['Source']:
+            return True
+        if ('MaximumExecutionFrequency' in params and
+                rule['MaximumExecutionFrequency'] != params['MaximumExecutionFrequency']):
             return True
         if rule.get('Description', '') != rule.get('Description', ''):
             return True

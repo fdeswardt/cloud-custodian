@@ -21,12 +21,12 @@ import time
 
 from dateutil import parser, tz as tzutil
 import jmespath
-import six
 
 from c7n.cwe import CloudWatchEvents
 from c7n.ctx import ExecutionContext
 from c7n.exceptions import PolicyValidationError, ClientError, ResourceLimitExceeded
 from c7n.filters import FilterRegistry, And, Or, Not
+from c7n.manager import iter_filters
 from c7n.output import DEFAULT_NAMESPACE, NullBlobOutput
 from c7n.resources import load_resources
 from c7n.registry import PluginRegistry
@@ -229,7 +229,7 @@ class PolicyExecutionMode:
         client = session.client('cloudwatch')
 
         for m in metrics:
-            if isinstance(m, six.string_types):
+            if isinstance(m, str):
                 dimensions = default_dimensions
             else:
                 m, m_dimensions = m
@@ -518,7 +518,10 @@ class LambdaMode(ServerlessExecutionMode):
 
 @execution.register('periodic')
 class PeriodicMode(LambdaMode, PullMode):
-    """A policy that runs in pull mode within lambda."""
+    """A policy that runs in pull mode within lambda.
+
+    Runs Custodian in AWS lambda at user defined cron interval.
+    """
 
     POLICY_METRICS = ('ResourceCount', 'ResourceTime', 'ActionTime')
 
@@ -531,7 +534,15 @@ class PeriodicMode(LambdaMode, PullMode):
 
 @execution.register('phd')
 class PHDMode(LambdaMode):
-    """Personal Health Dashboard event based policy execution."""
+    """Personal Health Dashboard event based policy execution.
+
+    PHD events are triggered by changes in the operations health of
+    AWS services and data center resources,
+
+    See `Personal Health Dashboard
+    <https://aws.amazon.com/premiumsupport/technology/personal-health-dashboard/>`_
+    for more details.
+    """
 
     schema = utils.type_schema(
         'phd',
@@ -589,6 +600,8 @@ class CloudTrailMode(LambdaMode):
 
     schema = utils.type_schema(
         'cloudtrail',
+        delay={'type': 'integer',
+               'description': 'sleep for delay seconds before processing an event'},
         events={'type': 'array', 'items': {
             'oneOf': [
                 {'type': 'string'},
@@ -607,7 +620,7 @@ class CloudTrailMode(LambdaMode):
         events = self.policy.data['mode'].get('events')
         assert events, "cloud trail mode requires specifiying events to subscribe"
         for e in events:
-            if isinstance(e, six.string_types):
+            if isinstance(e, str):
                 assert e in CloudWatchEvents.trail_events, "event shortcut not defined: %s" % e
             if isinstance(e, dict):
                 jmespath.compile(e['ids'])
@@ -618,13 +631,22 @@ class CloudTrailMode(LambdaMode):
                     "resource:%s does not support cloudtrail mode policies" % (
                         self.policy.resource_type))
 
+    def resolve_resources(self, event):
+        # override to enable delay before fetching resources
+        delay = self.policy.data.get('mode', {}).get('delay')
+        if delay:
+            time.sleep(delay)
+        return super().resolve_resources(event)
+
 
 @execution.register('ec2-instance-state')
 class EC2InstanceState(LambdaMode):
     """
     A lambda policy that executes on ec2 instance state changes.
 
-    https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html
+    See `EC2 lifecycles
+    <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html>`_
+    for more details.
     """
 
     schema = utils.type_schema(
@@ -636,7 +658,12 @@ class EC2InstanceState(LambdaMode):
 
 @execution.register('asg-instance-state')
 class ASGInstanceState(LambdaMode):
-    """a lambda policy that executes on an asg's ec2 instance state changes."""
+    """a lambda policy that executes on an asg's ec2 instance state changes.
+
+    See `ASG Events
+    <https://docs.aws.amazon.com/autoscaling/ec2/userguide/cloud-watch-events.html>`_
+    for more details.
+    """
 
     schema = utils.type_schema(
         'asg-instance-state', rinherit=LambdaMode.schema,
@@ -649,7 +676,11 @@ class ASGInstanceState(LambdaMode):
 class GuardDutyMode(LambdaMode):
     """Incident Response for AWS Guard Duty.
 
-    This policy fires on guard duty events for the given resource type.
+    AWS Guard Duty is a threat detection service that continuously
+    monitors for malicious activity and unauthorized behavior. This
+    mode allows you to execute polcies when various alerts are created
+    by AWS Guard Duty for automated incident response. See `Guard Duty
+    <https://aws.amazon.com/guardduty/>`_ for more details.
     """
 
     schema = utils.type_schema('guard-duty', rinherit=LambdaMode.schema)
@@ -691,10 +722,106 @@ class GuardDutyMode(LambdaMode):
         return super(GuardDutyMode, self).provision()
 
 
+@execution.register('config-poll-rule')
+class ConfigPollRuleMode(LambdaMode, PullMode):
+    """This mode represents a periodic/scheduled AWS config evaluation.
+
+    The primary benefit this mode offers is to support additional resources
+    beyond what config supports natively, as it can post evaluations for
+    any resource which has a cloudformation type. If a resource is natively
+    supported by config its highly recommended to use a `config-rule`
+    mode instead.
+
+    This mode effectively receives no data from config, instead its
+    periodically executed by config and polls and evaluates all
+    resources. It is equivalent to a periodic policy, except it also
+    pushes resource evaluations to config.
+    """
+    schema = utils.type_schema(
+        'config-poll-rule',
+        schedule={'enum': [
+            "One_Hour",
+            "Three_Hours",
+            "Six_Hours",
+            "Twelve_Hours",
+            "TwentyFour_Hours"]},
+        rinherit=LambdaMode.schema)
+
+    def validate(self):
+        super().validate()
+        if not self.policy.data['mode'].get('schedule'):
+            raise PolicyValidationError(
+                "policy:%s config-poll-rule schedule required" % (
+                    self.policy.name))
+        if self.policy.resource_manager.resource_type.config_type:
+            raise PolicyValidationError(
+                "resource:%s fully supported by config and should use mode: config-rule" % (
+                    self.policy.resource_type))
+        if self.policy.data['mode'].get('pattern'):
+            raise PolicyValidationError(
+                "policy:%s AWS Config does not support event pattern filtering" % (
+                    self.policy.name))
+        if not self.policy.resource_manager.resource_type.cfn_type:
+            raise PolicyValidationError((
+                'policy:%s resource:%s does not have a cloudformation type'
+                ' and is there-fore not supported by config-poll-rule'))
+
+    def _get_client(self):
+        return utils.local_session(
+            self.policy.session_factory).client('config')
+
+    def run(self, event, lambda_context):
+        cfg_event = json.loads(event['invokingEvent'])
+        resource_type = self.policy.resource_manager.resource_type.cfn_type
+        resource_id = self.policy.resource_manager.resource_type.id
+        client = self._get_client()
+
+        matched_resources = set()
+        for r in PullMode.run(self):
+            matched_resources.add(r[resource_id])
+        unmatched_resources = set()
+        for r in self.policy.resource_manager.get_resource_manager(
+                self.policy.resource_type).resources():
+            if r[resource_id] not in matched_resources:
+                unmatched_resources.add(r[resource_id])
+
+        evaluations = [dict(
+            ComplianceResourceType=resource_type,
+            ComplianceResourceId=r,
+            ComplianceType='NON_COMPLIANT',
+            OrderingTimestamp=cfg_event['notificationCreationTime'],
+            Annotation='The resource is not compliant with policy:%s.' % (
+                self.policy.name))
+            for r in matched_resources]
+        if evaluations:
+            self.policy.resource_manager.retry(
+                client.put_evaluations,
+                Evaluations=evaluations,
+                ResultToken=event.get('resultToken', 'No token found.'))
+
+        evaluations = [dict(
+            ComplianceResourceType=resource_type,
+            ComplianceResourceId=r,
+            ComplianceType='COMPLIANT',
+            OrderingTimestamp=cfg_event['notificationCreationTime'],
+            Annotation='The resource is compliant with policy:%s.' % (
+                self.policy.name))
+            for r in unmatched_resources]
+        if evaluations:
+            self.policy.resource_manager.retry(
+                client.put_evaluations,
+                Evaluations=evaluations,
+                ResultToken=event.get('resultToken', 'No token found.'))
+        return list(matched_resources)
+
+
 @execution.register('config-rule')
 class ConfigRuleMode(LambdaMode):
     """a lambda policy that executes as a config service rule.
-        http://docs.aws.amazon.com/config/latest/APIReference/API_PutConfigRule.html
+
+    The policy is invoked on configuration changes to resources.
+
+    See `AWS Config <https://aws.amazon.com/config/>`_ for more details.
     """
     cfg_event = None
     schema = utils.type_schema('config-rule', rinherit=LambdaMode.schema)
@@ -800,8 +927,7 @@ class PolicyConditions:
 
     def validate(self):
         self.filters.extend(self.convert_deprecated())
-        self.filters = self.filter_registry.parse(
-            self.filters, self.policy.resource_manager)
+        self.filters = self.filter_registry.parse(self.filters, self)
 
     def evaluate(self, event=None):
         policy_vars = dict(self.env_vars)
@@ -814,12 +940,16 @@ class PolicyConditions:
             'now': datetime.utcnow().replace(tzinfo=tzutil.tzutc()),
             'policy': self.policy.data
         })
+
         # note for no filters/conditions, this uses all([]) == true property.
         state = all([f.process([policy_vars], event) for f in self.filters])
         if not state:
             self.policy.log.info(
                 'Skipping policy:%s due to execution conditions', self.policy.name)
         return state
+
+    def iter_filters(self, block_end=False):
+        return iter_filters(self.filters, block_end=block_end)
 
     def convert_deprecated(self):
         filters = []
@@ -1024,9 +1154,18 @@ class Policy:
             permissions.update(a.get_permissions())
         return permissions
 
+    def _trim_runtime_filters(self):
+        from c7n.filters.core import trim_runtime
+        trim_runtime(self.conditions.filters)
+        trim_runtime(self.resource_manager.filters)
+
     def __call__(self):
         """Run policy in default mode"""
         mode = self.get_execution_mode()
+        if (isinstance(mode, ServerlessExecutionMode) or
+                self.options.dryrun):
+            self._trim_runtime_filters()
+
         if self.options.dryrun:
             resources = PullMode(self).run()
         elif not self.is_runnable():
