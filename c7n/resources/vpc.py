@@ -1948,7 +1948,7 @@ class NetworkAddress(query.QueryResourceManager):
         enum_spec = ('describe_addresses', 'Addresses', None)
         name = 'PublicIp'
         id = 'AllocationId'
-        filter_name = 'AllocationId'
+        filter_name = 'AllocationIds'
         filter_type = 'list'
         config_type = "AWS::EC2::EIP"
 
@@ -2182,7 +2182,6 @@ class KeyPair(query.QueryResourceManager):
         enum_spec = ('describe_key_pairs', 'KeyPairs', None)
         name = id = 'KeyName'
         filter_name = 'KeyNames'
-        taggable = False
 
 
 @KeyPair.filter_registry.register('unused')

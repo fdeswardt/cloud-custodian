@@ -534,6 +534,30 @@ class NetworkLocationTest(BaseTest):
                 "reason": "SecurityGroupMismatch"}],
         )
 
+    def test_network_compare_location_resource_missing(self):
+        self.factory = self.replay_flight_data("test_network_compare_location_resource_missing")
+        p = self.load_policy(
+            {
+                "name": "compare",
+                "resource": "aws.app-elb",
+                "filters": [
+                    {"type": "network-location", "key": "tag:NetworkLocation",
+                     "compare": ["subnet", "security-group"]}
+                ],
+            },
+            session_factory=self.factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        matched = resources.pop()
+        self.assertEqual(
+            matched["c7n:NetworkLocation"],
+            [
+                {'reason': 'LocationMismatch', 'security-groups': {},
+                 'subnets': {'subnet-914763e7': 'Public', 'subnet-efbcccb7': 'Public'}}
+            ],
+        )
+
     @functional
     def test_network_location_triple_intersect(self):
         self.factory = self.replay_flight_data("test_network_location_intersection")
@@ -866,6 +890,15 @@ class NetworkAddrTest(BaseTest):
         network_addr = ec2.allocate_address(Domain="vpc")
         self.addCleanup(self.release_if_still_present, ec2, network_addr)
         self.assert_policy_released(factory, ec2, network_addr)
+
+    def test_elastic_ip_get_resources(self):
+        factory = self.replay_flight_data('test_elasticip_get_resources')
+        p = self.load_policy({
+            'name': 'get-addresses',
+            'resource': 'network-addr'},
+            session_factory=factory)
+        resources = p.resource_manager.get_resources(['eipalloc-0da931198e499fdb0'])
+        self.assertJmes('[0].PrivateIpAddress', resources, '192.168.0.99')
 
     def test_elasticip_error(self):
         mock_factory = MagicMock()
@@ -2564,7 +2597,8 @@ class EndpointTest(BaseTest):
                 'name': 'vpc-endpoint-cross-account',
                 'resource': 'vpc-endpoint',
                 'filters': [
-                    {'type': 'cross-account'}
+                    {'type': 'cross-account',
+                     'whitelist_orgids': ['o-4amkskbcf1']}
                 ]
             },
             session_factory=session_factory
