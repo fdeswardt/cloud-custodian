@@ -1,4 +1,3 @@
-# Copyright 2015-2018 Capital One Services, LLC
 # Copyright The Cloud Custodian Authors.
 # SPDX-License-Identifier: Apache-2.0
 from datetime import datetime
@@ -927,10 +926,13 @@ class PolicyConditions:
         self.session_factory = rm.session_factory
         # used by c7n-org to extend evaluation conditions
         self.env_vars = {}
+        self.initialized = False
 
     def validate(self):
-        self.filters.extend(self.convert_deprecated())
-        self.filters = self.filter_registry.parse(self.filters, self)
+        if not self.initialized:
+            self.filters.extend(self.convert_deprecated())
+            self.filters = self.filter_registry.parse(self.filters, self)
+            self.initialized = True
 
     def evaluate(self, event=None):
         policy_vars = dict(self.env_vars)

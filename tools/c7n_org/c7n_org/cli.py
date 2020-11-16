@@ -1,4 +1,3 @@
-# Copyright 2017 Capital One Services, LLC
 # Copyright The Cloud Custodian Authors.
 # SPDX-License-Identifier: Apache-2.0
 """Run a custodian policy across an organization's accounts
@@ -18,7 +17,6 @@ from concurrent.futures import (
     as_completed)
 import yaml
 
-import boto3
 from botocore.compat import OrderedDict
 from botocore.exceptions import ClientError
 import click
@@ -189,9 +187,10 @@ def init(config, use, debug, verbose, accounts, tags, policies, resource=None, p
     return accounts_config, custodian_config, executor
 
 
-def resolve_regions(regions):
+def resolve_regions(regions, account):
     if 'all' in regions:
-        client = boto3.client('ec2')
+        session = get_session(account, 'c7n-org', "us-east-1")
+        client = session.client('ec2')
         return [region['RegionName'] for region in client.describe_regions()['Regions']]
     if not regions:
         return ('us-east-1', 'us-west-2')
@@ -340,7 +339,7 @@ def report(config, output, use, output_dir, accounts,
     with executor(max_workers=WORKER_COUNT) as w:
         futures = {}
         for a in accounts_config.get('accounts', ()):
-            for r in resolve_regions(region or a.get('regions', ())):
+            for r in resolve_regions(region or a.get('regions', ()), a):
                 futures[w.submit(
                     report_account,
                     a, r,
@@ -395,6 +394,7 @@ def _get_env_creds(account, session, region):
         env['AWS_SECRET_ACCESS_KEY'] = creds.secret_key
         env['AWS_SESSION_TOKEN'] = creds.token
         env['AWS_DEFAULT_REGION'] = region
+        env['AWS_ACCOUNT_ID'] = account["account_id"]
     elif account["provider"] == 'azure':
         env['AZURE_SUBSCRIPTION_ID'] = account["account_id"]
     elif account["provider"] == 'gcp':
@@ -457,7 +457,7 @@ def run_script(config, output_dir, accounts, tags, region, echo, serial, script_
     with executor(max_workers=WORKER_COUNT) as w:
         futures = {}
         for a in accounts_config.get('accounts', ()):
-            for r in resolve_regions(region or a.get('regions', ())):
+            for r in resolve_regions(region or a.get('regions', ()), a):
                 futures[
                     w.submit(run_account_script, a, r, output_dir,
                              serial, script_args)] = (a, r)
@@ -487,9 +487,10 @@ def run_script(config, output_dir, accounts, tags, region, echo, serial, script_
 
 def accounts_iterator(config):
     for a in config.get('accounts', ()):
-        if isinstance(a['role'], str) and not a['role'].startswith('arn'):
-            a['role'] = "arn:aws:iam::{}:role/{}".format(
-                a['account_id'], a['role'])
+        if 'role' in a:
+            if isinstance(a['role'], str) and not a['role'].startswith('arn'):
+                a['role'] = "arn:aws:iam::{}:role/{}".format(
+                    a['account_id'], a['role'])
         yield {**a, **{'provider': 'aws'}}
     for a in config.get('subscriptions', ()):
         d = {'account_id': a['subscription_id'],
@@ -638,7 +639,7 @@ def run(config, use, output_dir, accounts, tags, region,
     with executor(max_workers=WORKER_COUNT) as w:
         futures = {}
         for a in accounts_config['accounts']:
-            for r in resolve_regions(region or a.get('regions', ())):
+            for r in resolve_regions(region or a.get('regions', ()), a):
                 futures[w.submit(
                     run_account,
                     a, r,

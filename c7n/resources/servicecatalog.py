@@ -81,7 +81,7 @@ class CatalogPortfolioCrossAccount(CrossAccountAccessFilter):
 
     schema = type_schema(
         'cross-account',
-        whitelist_accounts_from={'$ref': '#/definitions/filters_common/value_from'},
+        whitelist_from={'$ref': '#/definitions/filters_common/value_from'},
         whitelist={'type': 'array', 'items': {'type': 'string'}})
 
     permissions = ('servicecatalog:ListPortfolioAccess',)
@@ -89,14 +89,13 @@ class CatalogPortfolioCrossAccount(CrossAccountAccessFilter):
 
     def check_access(self, client, accounts, resources):
         results = []
-        shared_accounts = set()
         for r in resources:
-            accounts = self.manager.retry(
+            shared_accounts = self.manager.retry(
                 client.list_portfolio_access, PortfolioId=r['Id'], ignore_err_codes=(
-                    'ResourceNotFoundException',))
-            if not accounts:
+                    'ResourceNotFoundException',)).get('AccountIds')
+            if not shared_accounts:
                 continue
-            shared_accounts = set(accounts.get('AccountIds'))
+            shared_accounts = set(shared_accounts)
             delta_accounts = shared_accounts.difference(accounts)
             if delta_accounts:
                 r[self.annotation_key] = list(delta_accounts)
